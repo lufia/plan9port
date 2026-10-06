@@ -57,6 +57,13 @@ struct WaylandClient {
 	int repeat_interval_ms;
 	int repeat_delay_ms;
 
+	// State for "key repeat" for the mouse scroll wheel.
+	// This allows touchpad devices to have accelerated scrolling.
+	int repeat_scroll_button;
+	int repeat_scroll_count;
+	int repeat_scroll_rate_ms;
+	int repeat_scroll_next_ms;
+
 	// The Wayland surface for this window
 	// and its corresponding xdg objects.
 	struct wl_surface *wl_surface;
@@ -70,6 +77,7 @@ struct WaylandClient {
 	// or scrolling is active, to implement key repeat and
 	// inertial scrolling.
 	struct wl_callback *wl_key_repeat_callback;
+	struct wl_callback *wl_scroll_repeat_callback;
 
 	// The mouse pointer and the surface for the current cursor.
 	struct wl_pointer *wl_pointer;
@@ -116,6 +124,9 @@ int entered_gfx_loop = 0;
 int key_repeat_delay_ms = 500;
 // The number of ms between repeats of a repeating key.
 int key_repeat_ms = 100;
+// The maximum number of ms between repeats of a scroll.
+// This is scaled by the number of repeating scrolls pending.
+int scroll_repeat_ms = 100;
 
 // A pool of xrgb888 buffers used for drawing to the screen.
 // When drawing, we give ownership of the buffer's memory to the compositor.
@@ -428,7 +439,6 @@ static void wl_callback_key_repeat(void *data, struct wl_callback *wl_callback, 
 
 	int repetitions = 0;
 	int repeat_rune = wl->repeat_rune;
-
 	if (wl->repeat_interval_ms == 0 || wl->repeat_rune == 0) {
 		goto done;
 	}
@@ -458,6 +468,44 @@ done:
 
 static const struct wl_callback_listener wl_callback_key_repeat_listener = {
 	.done = wl_callback_key_repeat,
+};
+
+static const struct wl_callback_listener wl_callback_scroll_listener;
+
+static void wl_callback_scroll_repeat(void *data, struct wl_callback *wl_callback, uint32_t time) {
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+
+	wl_callback_destroy(wl_callback);
+	qlock(&wayland_lock);
+
+	int x = wl->mouse_x;
+	int y = wl->mouse_y;
+	int repeat_scroll_button = 0;
+	if (wl->repeat_scroll_button && time >= wl->repeat_scroll_next_ms) {
+		repeat_scroll_button = wl->repeat_scroll_button | wl->buttons;
+		wl->repeat_scroll_count--;
+		if (wl->repeat_scroll_count == 0) {
+			wl->repeat_scroll_button = 0;
+		} else {
+			wl->repeat_scroll_next_ms = time + scroll_repeat_ms/wl->repeat_scroll_count;
+		}
+	}
+
+	if (wl->repeat_scroll_count > 0) {
+		wl_callback = wl_surface_frame(wl->wl_surface);
+		wl_callback_add_listener(wl_callback, &wl_callback_scroll_listener, c);
+		wl_surface_commit(wl->wl_surface);
+	}
+	qunlock(&wayland_lock);
+
+	if (repeat_scroll_button) {
+		gfx_mousetrack(c, x, y, repeat_scroll_button, (uint) time);
+	}
+}
+
+static const struct wl_callback_listener wl_callback_scroll_listener = {
+	.done = wl_callback_scroll_repeat,
 };
 
 void wl_pointer_enter(void *data,struct wl_pointer *wl_pointer, uint32_t serial,
@@ -582,6 +630,15 @@ void wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
 		b |= 1 << 3;
 	} else if (value > 0) {
 		b |= 1 << 4;
+	}
+	int mag = fabs(value);
+	if (mag > 1) {
+		wl->repeat_scroll_button = b;
+		wl->repeat_scroll_count = mag;
+		wl->repeat_scroll_next_ms = time + scroll_repeat_ms/wl->repeat_scroll_count;
+		wl->wl_scroll_repeat_callback = wl_surface_frame(wl->wl_surface);
+		wl_callback_add_listener(wl->wl_scroll_repeat_callback,
+				&wl_callback_scroll_listener, c);
 	}
 	b |= wl->buttons;
 
