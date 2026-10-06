@@ -62,6 +62,7 @@ struct WaylandClient {
 
 	// Key repeat configuration. Can be changed by
 	// wl_surface_repeat_info events.
+	int repeat_disabled;
 	int repeat_interval_ms;
 	int repeat_delay_ms;
 
@@ -455,7 +456,7 @@ static void wl_callback_key_repeat(void *data, struct wl_callback *wl_callback, 
 
 	int repetitions = 0;
 	int repeat_rune = wl->repeat_rune;
-	if (wl->repeat_interval_ms == 0 || wl->repeat_rune == 0) {
+	if (wl->repeat_disabled || wl->repeat_interval_ms == 0 || wl->repeat_rune == 0) {
 		goto done;
 	}
 
@@ -898,6 +899,7 @@ void zwp_text_input_v3_enter(void *data, struct zwp_text_input_v3 *text_input,
 	zwp_text_input_v3_enable(wl->text_input);
 	zwp_text_input_v3_commit(wl->text_input);
 	wl->ime.serial++;
+	wl->repeat_disabled = 1;
 	qunlock(&wayland_lock);
 }
 
@@ -910,6 +912,7 @@ void zwp_text_input_v3_leave(void *data, struct zwp_text_input_v3 *text_input,
 	qlock(&wayland_lock);
 	zwp_text_input_v3_disable(wl->text_input);
 	zwp_text_input_v3_commit(wl->text_input);
+	wl->repeat_disabled = 0;
 	qunlock(&wayland_lock);
 }
 
