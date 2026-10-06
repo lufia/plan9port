@@ -20,6 +20,7 @@
 #include "wayland-pointer-constraints.h"
 #include "wayland-xdg-decoration.h"
 #include "wayland-xdg-shell.h"
+#include "wayland-text-input.h"
 
 // alt+click and ctl+click are mapped to mouse buttons
 // to support single button mice.
@@ -34,6 +35,13 @@ struct WaylandBuffer {
 	struct wl_buffer* wl_buffer;
 };
 typedef struct WaylandBuffer WaylandBuffer;
+
+struct text_input_state {
+	uint32_t serial;
+	Rune commit[16];
+	Rune preedit[16];
+	Rune dot[16];
+};
 
 struct WaylandClient {
 	// The screen image written to by the client, and read by this driver.
@@ -89,6 +97,10 @@ struct WaylandClient {
 	struct xkb_context *xkb_context;
 	struct xkb_keymap *xkb_keymap;
 	struct xkb_state *xkb_state;
+
+	// For input methods
+	struct zwp_text_input_v3 *text_input;
+	struct text_input_state ime;
 };
 typedef struct WaylandClient WaylandClient;
 
@@ -112,6 +124,7 @@ uint32_t keyboard_enter_serial;
 // Need to NULL check them before using.
 static struct zxdg_decoration_manager_v1 *decoration_manager;
 static struct zwp_pointer_constraints_v1 *pointer_constraints;
+static struct zwp_text_input_manager_v3 *text_input_manager;
 
 // The wl output scale factor reported by wl_output.
 // We only set it if we get th event before entering the graphics loop.
@@ -176,6 +189,9 @@ static void registry_global(void *data, struct wl_registry *wl_registry,
 	} else if (strcmp(interface, zwp_pointer_constraints_v1_interface.name) == 0) {
 		pointer_constraints = wl_registry_bind(wl_registry, name,
 			&zwp_pointer_constraints_v1_interface, 1);
+
+	} else if (strcmp(interface, zwp_text_input_manager_v3_interface.name) == 0) {
+		text_input_manager = wl_registry_bind(wl_registry, name, &zwp_text_input_manager_v3_interface, 1);
 	}
 }
 
@@ -871,6 +887,117 @@ static const struct wl_keyboard_listener keyboard_listener = {
 	.repeat_info = wl_keyboard_repeat_info,
 };
 
+void zwp_text_input_v3_enter(void *data, struct zwp_text_input_v3 *text_input,
+	struct wl_surface *surface) {
+	DEBUG("zwp_text_input_v3_enter()\n");
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+
+	qlock(&wayland_lock);
+	memset(&wl->ime, 0, sizeof wl->ime);
+	zwp_text_input_v3_enable(wl->text_input);
+	zwp_text_input_v3_commit(wl->text_input);
+	wl->ime.serial++;
+	qunlock(&wayland_lock);
+}
+
+void zwp_text_input_v3_leave(void *data, struct zwp_text_input_v3 *text_input,
+	struct wl_surface *surface) {
+	DEBUG("zwp_text_input_v3_leave()\n");
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+
+	qlock(&wayland_lock);
+	zwp_text_input_v3_disable(wl->text_input);
+	zwp_text_input_v3_commit(wl->text_input);
+	qunlock(&wayland_lock);
+}
+
+void zwp_text_input_v3_preedit_string(void *data, struct zwp_text_input_v3 *text_input,
+	const char *text, int cursor_begin, int cursor_end) {
+	DEBUG("zwp_text_input_v3_preedit_string(text=%s, begin=%d, end=%d)\n", text, cursor_begin, cursor_end);
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+
+	qlock(&wayland_lock);
+	runesnprint(wl->ime.preedit, sizeof wl->ime.preedit, "%s", text);
+	qunlock(&wayland_lock);
+}
+
+void zwp_text_input_v3_commit_string(void *data, struct zwp_text_input_v3 *text_input,
+	const char *text) {
+	DEBUG("zwp_text_input_v3_commit_string(text=%s)\n", text);
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+
+	qlock(&wayland_lock);
+	runesnprint(wl->ime.commit, sizeof wl->ime.commit, "%s", text);
+	qunlock(&wayland_lock);
+}
+
+void zwp_text_input_v3_delete_surrounding_text(void *data, struct zwp_text_input_v3 *text_input,
+	uint32_t before_length, uint32_t after_length) {
+
+	// We shouldn't get these events because we never call set_surrounding_text
+	fprint(2, "unsupported zwp_text_input_v3::delete_surrounding_text(before=%ud, after=%ud)\n",
+		before_length, after_length);
+}
+
+int runeprefix(Rune *s1, Rune *s2) {
+	if (runestrstr(s1, s2) == s1) {
+		return runestrlen(s2);
+	} else if (runestrstr(s2, s1) == s2) {
+		return runestrlen(s1);
+	}
+	return 0;
+}
+
+// Try to replace s1, which is presumed to be displayed on the screen, with s2,
+// using a minimal number of key strokes. We make the assumption that the backspace
+// character deletes one rune.
+void replace_text(Client *c, Rune *s1, Rune *s2) {
+	int prefix = runeprefix(s1, s2);
+	int del = runestrlen(s1) - prefix;
+	int add = runestrlen(s2) - prefix;
+
+	for (int i = 0; i < del; i++) {
+		gfx_keystroke(c, Kbs);
+	}
+	for (int i = 0; i < add; i++) {
+		gfx_keystroke(c, s2[prefix + i]);
+	}
+}
+
+void zwp_text_input_v3_done(void *data, struct zwp_text_input_v3 *text_input,
+	uint32_t serial) {
+	DEBUG("zwp_text_input_v3_done(serial=%d)\n", serial);
+
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+
+	qlock(&wayland_lock);
+
+	replace_text(c, wl->ime.dot, wl->ime.preedit);
+	runestrcpy(wl->ime.dot, wl->ime.preedit);
+	wl->ime.preedit[0] = '\0';
+
+	if (runestrlen(wl->ime.commit) > 0) {
+		replace_text(c, wl->ime.dot, wl->ime.commit);
+		wl->ime.commit[0] = '\0';
+		wl->ime.dot[0] = '\0';
+	}
+	qunlock(&wayland_lock);
+}
+
+static const struct zwp_text_input_v3_listener text_input_listener = {
+	.enter = zwp_text_input_v3_enter,
+	.leave = zwp_text_input_v3_leave,
+	.preedit_string = zwp_text_input_v3_preedit_string,
+	.commit_string = zwp_text_input_v3_commit_string,
+	.delete_surrounding_text = zwp_text_input_v3_delete_surrounding_text,
+	.done = zwp_text_input_v3_done,
+};
+
 void	gfx_main(void) {
 	DEBUG("gfx_main called\n");
 
@@ -1156,6 +1283,14 @@ Memimage *rpc_attach(Client *c, char *label, char *winsize) {
 				decoration_manager, wl->xdg_toplevel);
 		zxdg_toplevel_decoration_v1_set_mode(d,
 			ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+	}
+
+	if (text_input_manager != NULL) {
+		wl->text_input = zwp_text_input_manager_v3_get_text_input(
+			text_input_manager, wl_seat);
+		if (wl->text_input != NULL) {
+			zwp_text_input_v3_add_listener(wl->text_input, &text_input_listener, c);
+		}
 	}
 
 	// TODO: parse winsize.
